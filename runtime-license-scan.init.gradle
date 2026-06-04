@@ -1,0 +1,1156 @@
+import groovy.json.JsonOutput
+import groovy.xml.XmlSlurper
+import org.gradle.api.GradleException
+import org.gradle.api.Project
+import org.gradle.api.artifacts.Configuration
+import org.gradle.api.artifacts.component.ComponentIdentifier
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+import org.gradle.api.artifacts.result.ArtifactResult
+import org.gradle.api.artifacts.result.ResolvedComponentResult
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+import org.gradle.api.artifacts.result.ResolvedArtifactResult
+import org.gradle.api.artifacts.result.UnresolvedArtifactResult
+import org.gradle.api.artifacts.result.UnresolvedDependencyResult
+import org.gradle.maven.MavenModule
+import org.gradle.maven.MavenPomArtifact
+
+import java.util.Locale
+import java.util.regex.Pattern
+import java.util.zip.ZipFile
+
+class RuntimeLicenseScanConfig {
+    // Edit this list to skip Gradle projects/subprojects before dependency resolution.
+    // Matches Gradle project path and project name. '*' is a wildcard.
+    // Examples:
+    // - 'com.heise.*' matches ':com:heise:app' and project name 'com.heise.app'.
+    // - 'hallo-welt-*' matches project names such as 'hallo-welt-api'.
+    static final List<String> EXCLUDED_PROJECTS = [
+        // 'com.heise.*',
+        // 'hallo-welt-*',
+    ]
+}
+
+class RuntimeLicenseScanRecord {
+    String group
+    String name
+    String version
+    ModuleComponentIdentifier componentId
+    Set<String> configurations = new TreeSet<>()
+    Set<String> sourceProjectPaths = new LinkedHashSet<>()
+    List<String> paths = []
+    Set<String> pathIndex = new LinkedHashSet<>()
+    RuntimeLicensePomResult pom
+    List<RuntimeLicenseJarEvidence> jarEvidence = []
+    Set<String> jarEvidenceIndex = new LinkedHashSet<>()
+    String jarEvidenceStatus = ''
+    int jarArtifactsInspected = 0
+    String risk = 'UNKNOWN'
+    String reason = ''
+
+    String coordinates() {
+        "${group}:${name}:${version}"
+    }
+
+    void addPath(List<String> path, int maxPaths) {
+        String rendered = path.join(' -> ')
+        if (pathIndex.add(rendered) && paths.size() < maxPaths) {
+            paths.add(rendered)
+        }
+    }
+
+    boolean addJarEvidence(String jarName, String entryName, String reportPath, int maxEvidenceFiles) {
+        String key = "${jarName}|${entryName}"
+        if (jarEvidenceIndex.add(key) && jarEvidence.size() < maxEvidenceFiles) {
+            jarEvidence.add(new RuntimeLicenseJarEvidence(jarName: jarName, entryName: entryName, reportPath: reportPath))
+            return true
+        }
+        return false
+    }
+}
+
+class RuntimeLicenseDependencyFrame {
+    ResolvedComponentResult component
+    List<String> path
+    Set<String> seen
+}
+
+class RuntimeLicensePomResult {
+    boolean readable = false
+    String status = ''
+    String message = ''
+    List<Map<String, String>> licenses = []
+}
+
+class RuntimeLicensePomFileResult {
+    File file
+    String message = ''
+}
+
+class RuntimeLicenseJarEvidence {
+    String jarName
+    String entryName
+    String reportPath
+}
+
+class RuntimeLicenseScanner {
+    static final List<String> RISK_ORDER = ['BLOCK', 'REVIEW', 'UNKNOWN', 'OK']
+
+    final Project rootProject
+    final Map<String, RuntimeLicenseScanRecord> records = new TreeMap<>()
+    final Map<String, RuntimeLicensePomResult> pomCache = [:]
+    final Map<String, RuntimeLicensePomFileResult> pomFileCache = [:]
+    final List<String> configurationNotes = []
+    final int maxPathsPerModule = 5
+    final int maxJarEvidenceFilesPerModule = 5
+    final int maxJarEvidenceBytes = 128 * 1024
+
+    RuntimeLicenseScanner(Project rootProject) {
+        this.rootProject = rootProject
+    }
+
+    void scan() {
+        collectRuntimeDependencies()
+
+        rootProject.logger.lifecycle("Analyzing licenses...")
+        records.values().each { RuntimeLicenseScanRecord record ->
+            record.pom = lookupPomLicenses(record)
+            Map<String, String> classification = classify(record.pom)
+            record.risk = classification.risk
+            record.reason = classification.reason
+        }
+
+        File outputDir = new File(rootProject.buildDir, 'reports/runtime-license-scan')
+        if (!outputDir.mkdirs() && !outputDir.isDirectory()) {
+            throw new GradleException("Could not create report directory: ${outputDir}")
+        }
+
+        if (includeJarLicenseEvidence()) {
+            collectJarLicenseEvidence(outputDir)
+        }
+
+        File markdownReport = new File(outputDir, 'runtime-license-report.md')
+        File tsvReport = new File(outputDir, 'runtime-license-report.tsv')
+        File jsonReport = new File(outputDir, 'runtime-license-report.json')
+        writeMarkdownReport(markdownReport)
+        writeTsvReport(tsvReport)
+        writeJsonReport(jsonReport)
+
+        Map<String, Integer> counts = riskCounts()
+        rootProject.logger.lifecycle("Runtime license scan complete: ${records.size()} external module(s).")
+        rootProject.logger.lifecycle("BLOCK=${counts.BLOCK ?: 0}, REVIEW=${counts.REVIEW ?: 0}, UNKNOWN=${counts.UNKNOWN ?: 0}, OK=${counts.OK ?: 0}")
+        rootProject.logger.lifecycle("Markdown report: ${markdownReport}")
+        rootProject.logger.lifecycle("TSV report: ${tsvReport}")
+        rootProject.logger.lifecycle("JSON report: ${jsonReport}")
+
+        boolean failOnBlocked = String.valueOf(rootProject.findProperty('failOnBlocked')).equalsIgnoreCase('true')
+        if (failOnBlocked && (counts.BLOCK ?: 0) > 0) {
+            throw new GradleException("Runtime license scan found ${counts.BLOCK} BLOCK dependency/dependencies.")
+        }
+    }
+
+    void collectRuntimeDependencies() {
+        List<Project> projects = rootProject.allprojects.toList()
+        int totalProjects = projects.size()
+        int projectCount = 0
+
+        rootProject.logger.lifecycle("Starting license scan for ${totalProjects} project(s)...")
+        projects.each { Project project ->
+            projectCount++
+            if (projectCount == 1 || projectCount % 10 == 0 || projectCount == totalProjects) {
+                rootProject.logger.lifecycle("Processing project ${projectCount}/${totalProjects}: ${project.path} (${records.size()} unique dependency/dependencies so far)")
+            }
+
+            String excludePattern = matchingProjectExcludePattern(project)
+            if (excludePattern) {
+                configurationNotes.add("${project.path}: skipped by project exclude pattern `${excludePattern}`.")
+                return
+            }
+
+            Configuration runtimeClasspath = project.configurations.findByName('runtimeClasspath')
+            if (runtimeClasspath == null) {
+                return
+            }
+            if (!isResolvable(runtimeClasspath)) {
+                configurationNotes.add("${project.path}: runtimeClasspath exists but is not resolvable.")
+                return
+            }
+
+            String configurationLabel = runtimeClasspathLabel(project)
+            Set<ComponentIdentifier> projectModuleIds = new LinkedHashSet<>()
+            ResolvedComponentResult rootComponent = null
+            try {
+                rootComponent = resolutionRoot(runtimeClasspath)
+                walkDependencies(project, rootComponent, configurationLabel, projectModuleIds)
+                preloadProjectPomFiles(project, projectModuleIds, projectCount, totalProjects)
+            } catch (Throwable throwable) {
+                configurationNotes.add("${configurationLabel}: could not resolve dependency graph (${shortMessage(throwable)}).")
+            } finally {
+                rootComponent = null
+                projectModuleIds.clear()
+                if (projectCount % 20 == 0) {
+                    System.gc()
+                }
+            }
+        }
+        rootProject.logger.lifecycle("Completed processing ${projectCount} project(s), found ${records.size()} unique runtime dependency/dependencies.")
+    }
+
+    void collectJarLicenseEvidence(File outputDir) {
+        List<RuntimeLicenseScanRecord> targetRecords = records.values().findAll { RuntimeLicenseScanRecord record ->
+            record.risk in ['BLOCK', 'REVIEW', 'UNKNOWN']
+        }
+        if (targetRecords.isEmpty()) {
+            return
+        }
+
+        rootProject.logger.lifecycle("Collecting local JAR license evidence for ${targetRecords.size()} non-OK module(s)...")
+
+        Map<String, Map<String, RuntimeLicenseScanRecord>> recordsByProject = [:].withDefault { new LinkedHashMap<String, RuntimeLicenseScanRecord>() }
+        targetRecords.each { RuntimeLicenseScanRecord record ->
+            record.sourceProjectPaths.each { String sourceProjectPath ->
+                recordsByProject[sourceProjectPath][record.coordinates()] = record
+            }
+        }
+
+        recordsByProject.each { String sourceProjectPath, Map<String, RuntimeLicenseScanRecord> recordsByCoordinate ->
+            Project project = rootProject.findProject(sourceProjectPath)
+            if (project == null) {
+                recordsByCoordinate.values().each { RuntimeLicenseScanRecord record ->
+                    record.jarEvidenceStatus = record.jarEvidenceStatus ?: "Could not inspect JAR license files: source project ${sourceProjectPath} was no longer available."
+                }
+                return
+            }
+
+            Configuration runtimeClasspath = project.configurations.findByName('runtimeClasspath')
+            if (runtimeClasspath == null || !isResolvable(runtimeClasspath)) {
+                recordsByCoordinate.values().each { RuntimeLicenseScanRecord record ->
+                record.jarEvidenceStatus = record.jarEvidenceStatus ?: "Could not inspect JAR license files: ${runtimeClasspathLabel(project)} was not resolvable."
+                }
+                return
+            }
+
+            try {
+                def artifacts = runtimeClasspath.incoming.artifactView { view ->
+                    view.lenient(true)
+                }.artifacts.artifacts
+
+                artifacts.each { ResolvedArtifactResult artifact ->
+                    ComponentIdentifier componentIdentifier = artifact.id.componentIdentifier
+                    if (!(componentIdentifier instanceof ModuleComponentIdentifier)) {
+                        return
+                    }
+
+                    ModuleComponentIdentifier moduleId = componentIdentifier as ModuleComponentIdentifier
+                    RuntimeLicenseScanRecord record = recordsByCoordinate[moduleKey(moduleId.group, moduleId.module, moduleId.version)]
+                    if (record == null || artifact.file == null || !artifact.file.name.toLowerCase(Locale.ROOT).endsWith('.jar')) {
+                        return
+                    }
+
+                    extractJarLicenseEvidence(record, artifact.file, outputDir)
+                }
+            } catch (Throwable throwable) {
+                recordsByCoordinate.values().each { RuntimeLicenseScanRecord record ->
+                    record.jarEvidenceStatus = record.jarEvidenceStatus ?: "Could not inspect JAR license files from ${runtimeClasspathLabel(project)} (${shortMessage(throwable)})."
+                }
+            }
+        }
+
+        targetRecords.each { RuntimeLicenseScanRecord record ->
+            if (!record.jarEvidence && !record.jarEvidenceStatus) {
+                record.jarEvidenceStatus = record.jarArtifactsInspected > 0
+                    ? 'No common license files were found in resolved runtime JAR artifact(s).'
+                    : 'No resolved runtime JAR artifact was available for local license-file inspection.'
+            }
+        }
+    }
+
+    void extractJarLicenseEvidence(RuntimeLicenseScanRecord record, File jarFile, File outputDir) {
+        if (record.jarEvidence.size() >= maxJarEvidenceFilesPerModule) {
+            return
+        }
+
+        record.jarArtifactsInspected++
+        try {
+            ZipFile zipFile = new ZipFile(jarFile)
+            try {
+                zipFile.entries().each { entry ->
+                    if (record.jarEvidence.size() >= maxJarEvidenceFilesPerModule) {
+                        return
+                    }
+                    if (entry.directory || !isLicenseEvidenceEntry(entry.name)) {
+                        return
+                    }
+
+                    String relativePath = writeJarEvidenceFile(record, jarFile.name, entry.name, zipFile, entry, outputDir)
+                    record.addJarEvidence(jarFile.name, entry.name, relativePath, maxJarEvidenceFilesPerModule)
+                }
+            } finally {
+                zipFile.close()
+            }
+        } catch (Throwable throwable) {
+            record.jarEvidenceStatus = record.jarEvidenceStatus ?: "Could not read local JAR license files from ${jarFile.name} (${shortMessage(throwable)})."
+        }
+    }
+
+    boolean isLicenseEvidenceEntry(String entryName) {
+        String normalized = entryName.toLowerCase(Locale.ROOT)
+        String baseName = normalized.tokenize('/').last() ?: normalized
+        baseName ==~ /(?i)(license|licence|notice|copying|copyright)([-_.].*)?/
+    }
+
+    String writeJarEvidenceFile(RuntimeLicenseScanRecord record, String jarName, String entryName, ZipFile zipFile, def entry, File outputDir) {
+        String moduleDir = safeFileName(record.coordinates())
+        String fileName = "${safeFileName(jarName)}-${safeFileName(entryName)}.txt"
+        String relativePath = "evidence/${moduleDir}/${fileName}"
+        File evidenceFile = new File(outputDir, relativePath)
+        if (!evidenceFile.parentFile.mkdirs() && !evidenceFile.parentFile.isDirectory()) {
+            throw new GradleException("Could not create evidence directory: ${evidenceFile.parentFile}")
+        }
+
+        byte[] bytes = readZipEntryBytes(zipFile, entry, maxJarEvidenceBytes + 1)
+        boolean truncated = bytes.length > maxJarEvidenceBytes
+        int length = Math.min(bytes.length, maxJarEvidenceBytes)
+        String text = new String(bytes, 0, length, 'UTF-8').replace('\u0000', '')
+
+        evidenceFile.withWriter('UTF-8') { writer ->
+            writer.println("Module: ${record.coordinates()}")
+            writer.println("JAR: ${jarName}")
+            writer.println("Entry: ${entryName}")
+            if (truncated) {
+                writer.println("Note: content truncated after ${maxJarEvidenceBytes} bytes.")
+            }
+            writer.println()
+            writer.print(text)
+            if (!text.endsWith('\n')) {
+                writer.println()
+            }
+        }
+        relativePath
+    }
+
+    byte[] readZipEntryBytes(ZipFile zipFile, def entry, int maxBytes) {
+        ByteArrayOutputStream output = new ByteArrayOutputStream()
+        InputStream input = zipFile.getInputStream(entry)
+        try {
+            byte[] buffer = new byte[8192]
+            int total = 0
+            while (total < maxBytes) {
+                int read = input.read(buffer, 0, Math.min(buffer.length, maxBytes - total))
+                if (read < 0) {
+                    break
+                }
+                output.write(buffer, 0, read)
+                total += read
+            }
+        } finally {
+            input.close()
+        }
+        output.toByteArray()
+    }
+
+    String matchingProjectExcludePattern(Project project) {
+        RuntimeLicenseScanConfig.EXCLUDED_PROJECTS.find { String pattern ->
+            String normalizedPattern = String.valueOf(pattern ?: '').trim()
+            normalizedPattern && projectIdentifierCandidates(project).any { String candidate ->
+                wildcardMatches(normalizedPattern, candidate)
+            }
+        }
+    }
+
+    List<String> projectIdentifierCandidates(Project project) {
+        String path = project.path ?: ''
+        String pathWithoutRootPrefix = path.startsWith(':') ? path.substring(1) : path
+        [
+            path,
+            pathWithoutRootPrefix,
+            pathWithoutRootPrefix.replace(':', '.'),
+            project.name ?: ''
+        ].findAll { it }.unique()
+    }
+
+    boolean wildcardMatches(String pattern, String value) {
+        value ==~ wildcardRegex(pattern)
+    }
+
+    String wildcardRegex(String pattern) {
+        '^' + pattern.split(/\*/, -1).collect { String part -> Pattern.quote(part) }.join('.*') + '$'
+    }
+
+    String runtimeClasspathLabel(Project project) {
+        project.path == ':' ? ':runtimeClasspath' : "${project.path}:runtimeClasspath"
+    }
+
+    boolean isResolvable(Configuration configuration) {
+        try {
+            return configuration.canBeResolved
+        } catch (MissingPropertyException ignored) {
+            return true
+        }
+    }
+
+    ResolvedComponentResult resolutionRoot(Configuration configuration) {
+        def result = configuration.incoming.resolutionResult
+        try {
+            return result.rootComponent.get()
+        } catch (MissingPropertyException ignored) {
+            return result.root
+        } catch (MissingMethodException ignored) {
+            return result.root
+        }
+    }
+
+    void walkDependencies(Project sourceProject, ResolvedComponentResult rootComponent, String configurationLabel, Set<ComponentIdentifier> projectModuleIds) {
+        Deque<RuntimeLicenseDependencyFrame> stack = new ArrayDeque<>()
+        stack.addLast(new RuntimeLicenseDependencyFrame(
+            component: rootComponent,
+            path: [configurationLabel],
+            seen: new LinkedHashSet<String>([componentIdentity(rootComponent)])
+        ))
+
+        while (!stack.isEmpty()) {
+            RuntimeLicenseDependencyFrame frame = stack.removeLast()
+            frame.component.dependencies.each { dependency ->
+                if (dependency instanceof ResolvedDependencyResult) {
+                    ResolvedComponentResult selected = dependency.selected
+                    String label = componentLabel(selected.id)
+                    List<String> nextPath = frame.path + label
+
+                    if (selected.id instanceof ModuleComponentIdentifier) {
+                        ModuleComponentIdentifier moduleId = selected.id as ModuleComponentIdentifier
+                        RuntimeLicenseScanRecord record = recordFor(moduleId)
+                        record.configurations.add(configurationLabel)
+                        record.sourceProjectPaths.add(sourceProject.path)
+                        record.addPath(nextPath, maxPathsPerModule)
+                        projectModuleIds.add(moduleId)
+                    }
+
+                    String identity = componentIdentity(selected)
+                    if (!frame.seen.contains(identity)) {
+                        Set<String> nextSeen = new LinkedHashSet<>(frame.seen)
+                        nextSeen.add(identity)
+                        stack.addLast(new RuntimeLicenseDependencyFrame(component: selected, path: nextPath, seen: nextSeen))
+                    }
+                } else if (dependency instanceof UnresolvedDependencyResult) {
+                    configurationNotes.add("${configurationLabel}: unresolved dependency ${dependency.requested}.")
+                }
+            }
+        }
+    }
+
+    RuntimeLicenseScanRecord recordFor(ModuleComponentIdentifier moduleId) {
+        String key = moduleKey(moduleId.group, moduleId.module, moduleId.version)
+        RuntimeLicenseScanRecord record = records[key]
+        if (record == null) {
+            record = new RuntimeLicenseScanRecord(group: moduleId.group, name: moduleId.module, version: moduleId.version, componentId: moduleId)
+            records[key] = record
+        }
+        record
+    }
+
+    void preloadProjectPomFiles(Project project, Set<ComponentIdentifier> componentIds, int projectIndex, int totalProjects) {
+        if (componentIds.isEmpty()) {
+            return
+        }
+
+        if (projectIndex == 1 || projectIndex % 10 == 0 || projectIndex == totalProjects) {
+            rootProject.logger.lifecycle("Resolving POMs ${projectIndex}/${totalProjects} for ${project.path} (${componentIds.size()} artifact(s))")
+        }
+
+        try {
+            def result = project.dependencies.createArtifactResolutionQuery()
+                .forComponents(componentIds)
+                .withArtifacts(MavenModule, MavenPomArtifact)
+                .execute()
+
+            result.resolvedComponents.each { component ->
+                cachePomArtifactResult(project, component.id, component.getArtifacts(MavenPomArtifact))
+            }
+            unresolvedComponentsOf(result).each { component ->
+                if (component.id instanceof ModuleComponentIdentifier) {
+                    ModuleComponentIdentifier id = component.id as ModuleComponentIdentifier
+                    pomFileCache[pomCacheKey(project, id.group, id.module, id.version)] =
+                        new RuntimeLicensePomFileResult(message: "Could not resolve POM component ${moduleKey(id.group, id.module, id.version)} (${shortMessage(component.failure)}).")
+                }
+            }
+        } catch (Throwable throwable) {
+            componentIds.findAll { it instanceof ModuleComponentIdentifier }.each { ModuleComponentIdentifier id ->
+                pomFileCache[pomCacheKey(project, id.group, id.module, id.version)] =
+                    new RuntimeLicensePomFileResult(message: "Could not run Maven POM artifact query for ${moduleKey(id.group, id.module, id.version)} (${shortMessage(throwable)}).")
+            }
+        }
+    }
+
+    RuntimeLicensePomResult lookupPomLicenses(RuntimeLicenseScanRecord record) {
+        RuntimeLicensePomResult lastResult = null
+        for (String sourceProjectPath : record.sourceProjectPaths) {
+            Project sourceProject = rootProject.findProject(sourceProjectPath)
+            if (sourceProject == null) {
+                lastResult = unknownPom("Source project ${sourceProjectPath} was no longer available for POM lookup.")
+                continue
+            }
+            RuntimeLicensePomResult result = readPomWithParents(sourceProject, record.group, record.name, record.version, 0, new LinkedHashSet<String>())
+            if (result.licenses) {
+                return result
+            }
+            lastResult = result
+        }
+        lastResult ?: unknownPom("No source project was available for POM lookup.")
+    }
+
+    RuntimeLicensePomResult readPomWithParents(Project project, String group, String name, String version, int depth, Set<String> visiting) {
+        if (!group || !name || !version) {
+            return unknownPom("Incomplete Maven coordinates: ${[group, name, version].findAll { it }.join(':')}")
+        }
+        if (depth > 8) {
+            return unknownPom("Stopped reading parent POMs after 8 levels for ${moduleKey(group, name, version)}.")
+        }
+
+        String cacheKey = "${project.path}|${moduleKey(group, name, version)}"
+        if (pomCache.containsKey(cacheKey)) {
+            return pomCache[cacheKey]
+        }
+        if (visiting.contains(cacheKey)) {
+            return unknownPom("Detected a parent POM cycle at ${moduleKey(group, name, version)}.")
+        }
+
+        Set<String> nextVisiting = new LinkedHashSet<>(visiting)
+        nextVisiting.add(cacheKey)
+
+        File pomFile
+        try {
+            pomFile = resolvePomFile(project, group, name, version)
+        } catch (Throwable throwable) {
+            RuntimeLicensePomResult result = unknownPom("Could not resolve POM for ${moduleKey(group, name, version)} (${shortMessage(throwable)}).")
+            pomCache[cacheKey] = result
+            return result
+        }
+
+        def pom
+        try {
+            XmlSlurper slurper = new XmlSlurper(false, false)
+            try {
+                slurper.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
+                slurper.setFeature('http://xml.org/sax/features/external-general-entities', false)
+                slurper.setFeature('http://xml.org/sax/features/external-parameter-entities', false)
+            } catch (Throwable ignored) {
+                // Feature support varies by parser; POMs are still parsed without validation.
+            }
+            pom = slurper.parse(pomFile)
+        } catch (Throwable throwable) {
+            RuntimeLicensePomResult result = unknownPom("Could not parse POM for ${moduleKey(group, name, version)} (${shortMessage(throwable)}).")
+            pomCache[cacheKey] = result
+            return result
+        }
+
+        Map<String, String> properties = pomProperties(pom, group, name, version)
+        List<Map<String, String>> licenses = extractLicenses(pom, properties)
+        if (licenses) {
+            RuntimeLicensePomResult result = new RuntimeLicensePomResult(readable: true, status: "Read POM license metadata for ${moduleKey(group, name, version)}.", licenses: licenses)
+            pomCache[cacheKey] = result
+            return result
+        }
+
+        String parentGroup = resolvePomText(textOf(pom.parent.groupId), properties) ?: group
+        String parentName = resolvePomText(textOf(pom.parent.artifactId), properties)
+        String parentVersion = resolvePomText(textOf(pom.parent.version), properties) ?: version
+        if (parentGroup && parentName && parentVersion) {
+            RuntimeLicensePomResult parentResult = readPomWithParents(project, parentGroup, parentName, parentVersion, depth + 1, nextVisiting)
+            if (parentResult.licenses) {
+                RuntimeLicensePomResult result = new RuntimeLicensePomResult(
+                    readable: true,
+                    status: "No direct license metadata in ${moduleKey(group, name, version)}; ${parentResult.status}",
+                    licenses: parentResult.licenses
+                )
+                pomCache[cacheKey] = result
+                return result
+            }
+        }
+
+        RuntimeLicensePomResult result = unknownPom("POM for ${moduleKey(group, name, version)} had no license metadata.")
+        result.readable = true
+        pomCache[cacheKey] = result
+        result
+    }
+
+    File resolvePomFile(Project project, String group, String name, String version) {
+        String cacheKey = pomCacheKey(project, group, name, version)
+        RuntimeLicensePomFileResult cached = pomFileCache[cacheKey]
+        if (cached == null) {
+            cached = queryPomFile(project, group, name, version)
+            pomFileCache[cacheKey] = cached
+        }
+        if (cached.file != null) {
+            return cached.file
+        }
+        throw new GradleException(cached.message ?: "Could not resolve POM for ${moduleKey(group, name, version)}.")
+    }
+
+    RuntimeLicensePomFileResult queryPomFile(Project project, String group, String name, String version) {
+        if (hasUnresolvedPlaceholder(group) || hasUnresolvedPlaceholder(name) || hasUnresolvedPlaceholder(version)) {
+            return new RuntimeLicensePomFileResult(message: "POM coordinates contain unresolved Maven properties: ${moduleKey(group, name, version)}.")
+        }
+
+        try {
+            def result = project.dependencies.createArtifactResolutionQuery()
+                .forModule(group, name, version)
+                .withArtifacts(MavenModule, MavenPomArtifact)
+                .execute()
+
+            RuntimeLicensePomFileResult resolved = null
+            result.resolvedComponents.each { component ->
+                if (resolved == null) {
+                    resolved = pomArtifactResult(component.id, component.getArtifacts(MavenPomArtifact))
+                }
+            }
+            if (resolved != null) {
+                return resolved
+            }
+
+            def unresolved = unresolvedComponentsOf(result).find()
+            if (unresolved != null) {
+                return new RuntimeLicensePomFileResult(message: "Could not resolve POM component ${moduleKey(group, name, version)} (${shortMessage(unresolved.failure)}).")
+            }
+            new RuntimeLicensePomFileResult(message: "No Maven POM artifact was returned for ${moduleKey(group, name, version)}.")
+        } catch (Throwable throwable) {
+            new RuntimeLicensePomFileResult(message: "Could not run Maven POM artifact query for ${moduleKey(group, name, version)} (${shortMessage(throwable)}).")
+        }
+    }
+
+    void cachePomArtifactResult(Project project, def componentId, Collection<ArtifactResult> artifacts) {
+        if (!(componentId instanceof ModuleComponentIdentifier)) {
+            return
+        }
+        ModuleComponentIdentifier id = componentId as ModuleComponentIdentifier
+        pomFileCache[pomCacheKey(project, id.group, id.module, id.version)] = pomArtifactResult(id, artifacts)
+    }
+
+    RuntimeLicensePomFileResult pomArtifactResult(def componentId, Collection<ArtifactResult> artifacts) {
+        ArtifactResult resolved = artifacts.find { it instanceof ResolvedArtifactResult }
+        if (resolved != null) {
+            return new RuntimeLicensePomFileResult(file: (resolved as ResolvedArtifactResult).file)
+        }
+
+        ArtifactResult unresolved = artifacts.find { it instanceof UnresolvedArtifactResult }
+        if (unresolved != null) {
+            return new RuntimeLicensePomFileResult(message: "Could not resolve POM artifact for ${componentId.displayName} (${shortMessage((unresolved as UnresolvedArtifactResult).failure)}).")
+        }
+
+        new RuntimeLicensePomFileResult(message: "No Maven POM artifact was returned for ${componentId.displayName}.")
+    }
+
+    Collection unresolvedComponentsOf(def artifactResolutionResult) {
+        try {
+            return artifactResolutionResult.unresolvedComponents ?: []
+        } catch (MissingPropertyException ignored) {
+            return []
+        } catch (MissingMethodException ignored) {
+            return []
+        }
+    }
+
+    List<Map<String, String>> extractLicenses(def pom, Map<String, String> properties) {
+        List<Map<String, String>> licenses = []
+        pom.licenses.license.each { license ->
+            String licenseName = resolvePomText(textOf(license.name), properties)
+            String licenseUrl = resolvePomText(textOf(license.url), properties)
+            String comments = resolvePomText(textOf(license.comments), properties)
+            if (licenseName || licenseUrl || comments) {
+                licenses.add([name: licenseName, url: licenseUrl, comments: comments])
+            }
+        }
+        licenses
+    }
+
+    Map<String, String> pomProperties(def pom, String group, String name, String version) {
+        Map<String, String> properties = new LinkedHashMap<>()
+        String pomGroup = textOf(pom.groupId) ?: textOf(pom.parent.groupId) ?: group
+        String pomVersion = textOf(pom.version) ?: textOf(pom.parent.version) ?: version
+        properties.putAll([
+            'groupId': group,
+            'artifactId': name,
+            'version': version,
+            'project.groupId': group,
+            'project.artifactId': name,
+            'project.version': version,
+            'pom.groupId': pomGroup,
+            'pom.artifactId': textOf(pom.artifactId) ?: name,
+            'pom.version': pomVersion
+        ])
+
+        pom.properties.children().each { property ->
+            String key = String.valueOf(property.name())
+            String value = textOf(property)
+            if (key && value) {
+                properties[key] = value
+            }
+        }
+
+        8.times {
+            properties.keySet().toList().each { String key ->
+                properties[key] = resolvePomText(properties[key], properties)
+            }
+        }
+        properties
+    }
+
+    String resolvePomText(String value, Map<String, String> properties) {
+        if (!value) {
+            return ''
+        }
+
+        String resolved = value
+        for (int i = 0; i < 8; i++) {
+            String next = resolved.replaceAll(/\$\{([^}]+)\}/) { String match, String key ->
+                properties.containsKey(key) ? String.valueOf(properties[key]) : match
+            }
+            if (next == resolved) {
+                return resolved
+            }
+            resolved = next
+        }
+        resolved
+    }
+
+    boolean hasUnresolvedPlaceholder(String value) {
+        value != null && (value ==~ /.*\$\{[^}]+}.*/)
+    }
+
+    Map<String, String> classify(RuntimeLicensePomResult pom) {
+        if (pom == null || !pom.licenses) {
+            return [risk: 'UNKNOWN', reason: pom?.message ?: 'Missing license metadata.']
+        }
+
+        String normalized = pom.licenses.collect { Map<String, String> license ->
+            [license.name, license.url, license.comments].findAll { it }.join(' ')
+        }.join(' | ').toLowerCase(Locale.ROOT)
+
+        boolean classpathException = normalized.contains('classpath')
+        boolean agpl = hasToken(normalized, 'agpl') || normalized.contains('affero general public license') || normalized.contains('/agpl')
+        boolean lgpl = hasToken(normalized, 'lgpl') || normalized.contains('lesser general public license') || normalized.contains('library general public license') || normalized.contains('/lgpl')
+        boolean gpl = hasToken(normalized, 'gpl') || normalized.contains('gnu general public license') || normalized.contains('/gpl') || (normalized.contains('general public license') && !lgpl && !agpl)
+        boolean mpl = hasToken(normalized, 'mpl') || normalized.contains('mozilla public license')
+        boolean epl = hasToken(normalized, 'epl') || normalized.contains('eclipse public license')
+        boolean cddl = hasToken(normalized, 'cddl') || normalized.contains('common development and distribution license')
+        boolean permissive = hasPermissiveLicenseSignal(normalized)
+        boolean licenseChoice = hasLicenseChoiceSignal(normalized)
+
+        if (agpl) {
+            return [risk: 'BLOCK', reason: 'AGPL-family license metadata found.']
+        }
+        if (gpl && !lgpl && !classpathException && permissive && licenseChoice) {
+            return [risk: 'REVIEW', reason: 'GPL-family license metadata appears in a license choice with permissive metadata; review selected license option.']
+        }
+        if (gpl && !lgpl && !classpathException) {
+            return [risk: 'BLOCK', reason: 'GPL-family license metadata found without LGPL or Classpath Exception.']
+        }
+        if (gpl && classpathException) {
+            return [risk: 'REVIEW', reason: 'GPL-family license metadata found with Classpath Exception.']
+        }
+        if (lgpl) {
+            return [risk: 'REVIEW', reason: 'LGPL-family license metadata found.']
+        }
+        if (mpl) {
+            return [risk: 'REVIEW', reason: 'MPL-family license metadata found.']
+        }
+        if (epl) {
+            return [risk: 'REVIEW', reason: 'EPL-family license metadata found.']
+        }
+        if (cddl) {
+            return [risk: 'REVIEW', reason: 'CDDL-family license metadata found.']
+        }
+        [risk: 'OK', reason: 'No obvious copyleft risk found in POM license metadata.']
+    }
+
+    boolean hasToken(String text, String token) {
+        text ==~ /(?s).*(^|[^a-z0-9])${java.util.regex.Pattern.quote(token)}([^a-z0-9]|$).*/
+    }
+
+    boolean hasPermissiveLicenseSignal(String text) {
+        hasToken(text, 'mit') ||
+            hasToken(text, 'bsd') ||
+            hasToken(text, 'isc') ||
+            text.contains('apache license') ||
+            text.contains('apache-2.0') ||
+            text.contains('apache 2.0') ||
+            text.contains('public domain')
+    }
+
+    boolean hasLicenseChoiceSignal(String text) {
+        text.contains(' or ') ||
+            text.contains('||') ||
+            text.contains(' either ') ||
+            text.contains('dual licens')
+    }
+
+    void writeMarkdownReport(File file) {
+        List<RuntimeLicenseScanRecord> sortedRecords = sortedRecords()
+        Map<String, Integer> counts = riskCounts()
+
+        file.withWriter('UTF-8') { writer ->
+            writer.println('# Runtime License Scan')
+            writer.println()
+            writer.println('This report was generated from Gradle `runtimeClasspath` dependency graphs and Maven POM license metadata.')
+            if (includeJarLicenseEvidence()) {
+                writer.println('Local JAR license-file evidence was collected for `BLOCK`, `REVIEW`, and `UNKNOWN` findings when runtime JAR artifacts were available.')
+            } else {
+                writer.println('Local JAR license-file evidence was not collected. Run with `-PincludeJarLicenseEvidence=true` to copy common license files from resolved runtime JAR artifacts into this report directory.')
+            }
+            writer.println()
+            writer.println('## Summary')
+            writer.println()
+            writer.println('| Risk | Count |')
+            writer.println('| --- | ---: |')
+            RISK_ORDER.each { risk ->
+                writer.println("| ${risk} | ${counts[risk] ?: 0} |")
+            }
+            writer.println()
+            writer.println('## Policy')
+            writer.println()
+            writer.println('| Risk | Meaning | Default Action |')
+            writer.println('| --- | --- | --- |')
+            RISK_ORDER.each { risk ->
+                writer.println("| ${risk} | ${markdown(policyMeaning(risk))} | ${markdown(actionForRisk(risk))} |")
+            }
+            writer.println()
+            writer.println('## Triage Guidance')
+            writer.println()
+            writer.println('- `BLOCK`: treat as a release blocker until reviewed and approved by the project owner or legal/compliance owner.')
+            writer.println('- `REVIEW`: inspect the dependency, its usage, and your distribution model before accepting it.')
+            writer.println('- `UNKNOWN`: do not treat as OK; manually verify upstream license information.')
+            writer.println('- `OK`: no obvious copyleft risk was found in Maven POM metadata, but this is not legal advice.')
+            writer.println()
+            writer.println('## Scanned Configurations')
+            writer.println()
+            Set<String> configurations = new TreeSet<>()
+            sortedRecords.each { configurations.addAll(it.configurations) }
+            if (configurations) {
+                configurations.each { writer.println("- `${it}`") }
+            } else {
+                writer.println('No resolvable `runtimeClasspath` configurations with external modules were found.')
+            }
+            if (configurationNotes) {
+                writer.println()
+                writer.println('## Resolution Notes')
+                writer.println()
+                configurationNotes.each { writer.println("- ${markdown(it)}") }
+            }
+            writer.println()
+            writer.println('## Findings')
+            writer.println()
+            writer.println('| Risk | Action | Dependency | License Metadata | POM Evidence | JAR Evidence | Inspect Command | Reason | Paths |')
+            writer.println('| --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+            if (sortedRecords) {
+                sortedRecords.each { RuntimeLicenseScanRecord record ->
+                    writer.println("| ${record.risk} | ${markdown(actionForRisk(record.risk))} | `${markdown(record.coordinates())}` | ${markdown(licenseSummary(record))} | ${markdown(pomEvidence(record))} | ${markdown(jarEvidenceSummary(record))} | ${markdown(dependencyInsightSummary(record))} | ${markdown(record.reason)} | ${markdown(pathSummary(record))} |")
+                }
+            } else {
+                writer.println('| OK | No action needed. | No external runtime modules found. |  |  |  |  |  |  |')
+            }
+        }
+    }
+
+    void writeTsvReport(File file) {
+        file.withWriter('UTF-8') { writer ->
+            writer.println(['risk', 'needs_manual_review', 'action', 'coordinates', 'license_names', 'license_urls', 'reason', 'pom_evidence', 'jar_evidence', 'dependency_insight_commands', 'configurations', 'paths'].join('\t'))
+            sortedRecords().each { RuntimeLicenseScanRecord record ->
+                writer.println([
+                    record.risk,
+                    String.valueOf(needsManualReview(record)),
+                    actionForRisk(record.risk),
+                    record.coordinates(),
+                    record.pom?.licenses?.collect { it.name ?: '' }?.findAll { it }?.join(' | ') ?: '',
+                    record.pom?.licenses?.collect { it.url ?: '' }?.findAll { it }?.join(' | ') ?: '',
+                    record.reason,
+                    pomEvidence(record),
+                    jarEvidenceText(record),
+                    dependencyInsightCommands(record).join(' | '),
+                    record.configurations.join(' | '),
+                    record.paths.join(' || ')
+                ].collect { tsv(it) }.join('\t'))
+            }
+        }
+    }
+
+    void writeJsonReport(File file) {
+        Map<String, Integer> counts = riskCounts()
+        Map<String, Object> report = [
+            schemaVersion: '1.0',
+            summary: [
+                total: records.size(),
+                BLOCK: counts.BLOCK ?: 0,
+                REVIEW: counts.REVIEW ?: 0,
+                UNKNOWN: counts.UNKNOWN ?: 0,
+                OK: counts.OK ?: 0,
+                needsManualReview: needsManualReviewCount(counts)
+            ],
+            scannedConfigurations: scannedConfigurations(),
+            resolutionNotes: configurationNotes,
+            findings: sortedRecords().collect { RuntimeLicenseScanRecord record -> findingJson(record) }
+        ]
+
+        file.withWriter('UTF-8') { writer ->
+            writer.println(JsonOutput.prettyPrint(JsonOutput.toJson(report)))
+        }
+    }
+
+    Map<String, Object> findingJson(RuntimeLicenseScanRecord record) {
+        [
+            risk: record.risk,
+            needsManualReview: needsManualReview(record),
+            action: actionForRisk(record.risk),
+            reason: record.reason,
+            coordinates: [
+                group: record.group,
+                name: record.name,
+                version: record.version,
+                gav: record.coordinates()
+            ],
+            licenses: licenseJson(record),
+            pomEvidence: pomEvidence(record),
+            jarEvidence: jarEvidenceJson(record),
+            configurations: record.configurations.toList(),
+            paths: record.paths,
+            dependencyInsightCommands: dependencyInsightCommands(record)
+        ]
+    }
+
+    List<Map<String, String>> licenseJson(RuntimeLicenseScanRecord record) {
+        if (!record.pom?.licenses) {
+            return []
+        }
+        record.pom.licenses.collect { Map<String, String> license ->
+            [
+                name: license.name ?: '',
+                url: license.url ?: '',
+                comments: license.comments ?: ''
+            ]
+        }
+    }
+
+    List<Map<String, String>> jarEvidenceJson(RuntimeLicenseScanRecord record) {
+        record.jarEvidence.collect { RuntimeLicenseJarEvidence evidence ->
+            [
+                jarName: evidence.jarName,
+                entryName: evidence.entryName,
+                reportPath: evidence.reportPath
+            ]
+        }
+    }
+
+    List<String> scannedConfigurations() {
+        Set<String> configurations = new TreeSet<>()
+        records.values().each { RuntimeLicenseScanRecord record ->
+            configurations.addAll(record.configurations)
+        }
+        configurations.toList()
+    }
+
+    List<RuntimeLicenseScanRecord> sortedRecords() {
+        records.values().toList().sort { RuntimeLicenseScanRecord a, RuntimeLicenseScanRecord b ->
+            int riskCompare = riskRank(a.risk) <=> riskRank(b.risk)
+            riskCompare != 0 ? riskCompare : a.coordinates() <=> b.coordinates()
+        }
+    }
+
+    int riskRank(String risk) {
+        int index = RISK_ORDER.indexOf(risk)
+        index >= 0 ? index : RISK_ORDER.size()
+    }
+
+    Map<String, Integer> riskCounts() {
+        Map<String, Integer> counts = [:].withDefault { 0 }
+        records.values().each { counts[it.risk] = counts[it.risk] + 1 }
+        counts
+    }
+
+    int needsManualReviewCount(Map<String, Integer> counts) {
+        (counts.BLOCK ?: 0) + (counts.REVIEW ?: 0) + (counts.UNKNOWN ?: 0)
+    }
+
+    boolean needsManualReview(RuntimeLicenseScanRecord record) {
+        needsManualReview(record.risk)
+    }
+
+    boolean needsManualReview(String risk) {
+        risk in ['BLOCK', 'REVIEW', 'UNKNOWN']
+    }
+
+    String policyMeaning(String risk) {
+        switch (risk) {
+            case 'BLOCK':
+                return 'AGPL, or GPL without LGPL and without Classpath Exception.'
+            case 'REVIEW':
+                return 'LGPL, MPL, EPL, CDDL, or GPL with Classpath Exception.'
+            case 'UNKNOWN':
+                return 'Missing, unreadable, unresolved, or empty Maven POM license metadata.'
+            case 'OK':
+                return 'No obvious copyleft risk found in Maven POM license metadata.'
+            default:
+                return 'Unrecognized risk category.'
+        }
+    }
+
+    String actionForRisk(String risk) {
+        switch (risk) {
+            case 'BLOCK':
+                return 'Block release until reviewed.'
+            case 'REVIEW':
+                return 'Review dependency and usage.'
+            case 'UNKNOWN':
+                return 'Manually verify license.'
+            case 'OK':
+                return 'No action from POM metadata.'
+            default:
+                return 'Review manually.'
+        }
+    }
+
+    String licenseSummary(RuntimeLicenseScanRecord record) {
+        if (!record.pom?.licenses) {
+            return record.pom?.message ?: 'Missing license metadata.'
+        }
+        record.pom.licenses.collect { Map<String, String> license ->
+            String name = license.name ?: 'Unnamed license'
+            license.url ? "${name} (${license.url})" : name
+        }.join('<br>')
+    }
+
+    String pomEvidence(RuntimeLicenseScanRecord record) {
+        record.pom?.status ?: record.pom?.message ?: 'No POM evidence available.'
+    }
+
+    String jarEvidenceSummary(RuntimeLicenseScanRecord record) {
+        if (record.risk == 'OK') {
+            return 'Not scanned for OK findings.'
+        }
+        if (record.jarEvidence) {
+            return record.jarEvidence.collect { RuntimeLicenseJarEvidence evidence ->
+                "[`${evidence.entryName}`](${evidence.reportPath}) from `${evidence.jarName}`"
+            }.join('<br>')
+        }
+        record.jarEvidenceStatus ?: 'Not scanned. Run with -PincludeJarLicenseEvidence=true.'
+    }
+
+    String jarEvidenceText(RuntimeLicenseScanRecord record) {
+        if (record.risk == 'OK') {
+            return 'Not scanned for OK findings.'
+        }
+        if (record.jarEvidence) {
+            return record.jarEvidence.collect { RuntimeLicenseJarEvidence evidence ->
+                "${evidence.entryName} -> ${evidence.reportPath} from ${evidence.jarName}"
+            }.join(' | ')
+        }
+        record.jarEvidenceStatus ?: 'Not scanned. Run with -PincludeJarLicenseEvidence=true.'
+    }
+
+    String dependencyInsightSummary(RuntimeLicenseScanRecord record) {
+        List<String> commands = dependencyInsightCommands(record)
+        commands ? commands.collect { "`$it`" }.join('<br>') : 'Not needed for OK findings.'
+    }
+
+    List<String> dependencyInsightCommands(RuntimeLicenseScanRecord record) {
+        if (!needsManualReview(record)) {
+            return []
+        }
+        record.configurations.collect { String configuration ->
+            dependencyInsightCommand(record, configuration)
+        }.findAll { it }.unique()
+    }
+
+    String dependencyInsightCommand(RuntimeLicenseScanRecord record, String configurationLabel) {
+        String dependencySelector = "${record.group}:${record.name}"
+        if (configurationLabel == ':runtimeClasspath') {
+            return "./gradlew dependencyInsight --dependency ${dependencySelector} --configuration runtimeClasspath"
+        }
+        if (configurationLabel?.endsWith(':runtimeClasspath')) {
+            String projectPath = configurationLabel.substring(0, configurationLabel.length() - ':runtimeClasspath'.length())
+            if (projectPath) {
+                return "./gradlew ${projectPath}:dependencyInsight --dependency ${dependencySelector} --configuration runtimeClasspath"
+            }
+        }
+        "./gradlew dependencyInsight --dependency ${dependencySelector} --configuration runtimeClasspath"
+    }
+
+    String pathSummary(RuntimeLicenseScanRecord record) {
+        if (!record.paths) {
+            return 'No dependency path available.'
+        }
+        record.paths.collect { "`$it`" }.join('<br>')
+    }
+
+    RuntimeLicensePomResult unknownPom(String message) {
+        new RuntimeLicensePomResult(readable: false, message: message)
+    }
+
+    boolean includeJarLicenseEvidence() {
+        String.valueOf(rootProject.findProperty('includeJarLicenseEvidence')).equalsIgnoreCase('true')
+    }
+
+    String componentLabel(def id) {
+        if (id instanceof ModuleComponentIdentifier) {
+            return moduleKey(id.group, id.module, id.version)
+        }
+        if (id instanceof ProjectComponentIdentifier) {
+            return "project ${id.projectPath}"
+        }
+        id.displayName
+    }
+
+    String componentIdentity(ResolvedComponentResult component) {
+        component.id.displayName
+    }
+
+    String moduleKey(String group, String name, String version) {
+        "${group}:${name}:${version}"
+    }
+
+    String pomCacheKey(Project project, String group, String name, String version) {
+        "${project.path}|${moduleKey(group, name, version)}"
+    }
+
+    String textOf(def node) {
+        String value = node?.text()
+        value == null ? '' : value.trim().replaceAll(/\s+/, ' ')
+    }
+
+    String markdown(Object value) {
+        String text = String.valueOf(value ?: '')
+        text.replace('|', '\\|').replace('\r', ' ').replace('\n', '<br>')
+    }
+
+    String tsv(Object value) {
+        String.valueOf(value ?: '').replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+    }
+
+    String safeFileName(String value) {
+        String sanitized = String.valueOf(value ?: 'value').replaceAll(/[^A-Za-z0-9._-]+/, '_')
+        sanitized = sanitized.replaceAll(/^_+/, '').replaceAll(/_+$/, '')
+        sanitized ?: 'value'
+    }
+
+    String shortMessage(Throwable throwable) {
+        String message = throwable.message ?: throwable.class.simpleName
+        message = message.replaceAll(/\s+/, ' ').trim()
+        if (message.length() > 220) {
+            message = message.substring(0, 217) + '...'
+        }
+        "${throwable.class.simpleName}: ${message}"
+    }
+}
+
+gradle.projectsEvaluated {
+    Project root = gradle.rootProject
+    if (root.tasks.findByName('scanRuntimeLicenses') != null) {
+        root.logger.warn('A task named scanRuntimeLicenses already exists; runtime-license-scan.init.gradle did not replace it.')
+        return
+    }
+
+    root.tasks.create('scanRuntimeLicenses') {
+        group = 'verification'
+        description = 'Scans all resolvable runtimeClasspath dependency graphs for license risks using Maven POM metadata.'
+        doLast {
+            new RuntimeLicenseScanner(root).scan()
+        }
+    }
+}
